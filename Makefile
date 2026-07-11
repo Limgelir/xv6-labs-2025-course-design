@@ -278,7 +278,8 @@ ifeq ($(LAB),util)
 	UPROGS += \
 		$U/_sleep\
 		$U/_sixfive\
-		$U/_memdump
+		$U/_memdump\
+		$U/_find
 endif
 
 
