@@ -1,0 +1,79 @@
+Lab System Calls - Using gdb
+
+1. Looking at the backtrace output, which function called syscall()?
+
+Answer:
+The backtrace shows that usertrap() called syscall().
+
+The relevant call stack was:
+
+#0 syscall() at kernel/syscall.c
+#1 usertrap() at kernel/trap.c
+
+
+2. What is the value of p->trapframe->a7 and what does that value represent?
+
+Answer:
+The value of p->trapframe->a7 was 0xf, which is decimal 15.
+
+According to kernel/syscall.h, system call number 15 corresponds to SYS_open.
+The a7 register stores the system call number requested by the user process.
+Therefore, the current process was requesting the open() system call.
+
+
+3. What was the previous mode that the CPU was in?
+
+Answer:
+The previous CPU mode was user mode.
+
+The CPU is currently executing the system call handler in supervisor mode, but
+the SPP bit in the sstatus register is 0. An SPP value of 0 indicates that the
+trap originated from user mode.
+
+
+4. Write down the assembly instruction at which the kernel panicked.
+Which register corresponds to the variable num?
+
+Answer:
+The kernel panicked at address 0x80001cf8.
+
+The faulting assembly instruction was:
+
+lw a3, 0(zero)
+
+This instruction attempts to load a 32-bit value from virtual address 0 into
+register a3.
+
+Register a3 corresponds to the local variable num.
+
+
+5. Why did the kernel crash?
+
+Answer:
+The statement:
+
+num = *(int *)0;
+
+dereferences a null pointer and attempts to read an integer from virtual
+address 0.
+
+Virtual address 0 is not mapped in the xv6 kernel address space. Therefore,
+the load instruction generated a load page fault. The value of stval was 0x0,
+which confirms that the faulting virtual address was zero. The scause value
+0xd indicates a load page fault.
+
+Because the page fault occurred while the CPU was executing in kernel mode,
+kerneltrap() treated it as a fatal kernel error and called panic.
+
+
+6. What is the name of the process that was running when the kernel panicked?
+What is its process ID?
+
+Answer:
+The process name was:
+
+init
+
+Its process ID was:
+
+1
