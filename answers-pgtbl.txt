@@ -1,0 +1,195 @@
+Lab Page Tables
+Exercise 1: Inspect a user-process page table
+
+The output of print_pgtbl was:
+
+va 0x0          pte 0x21FC885B pa 0x87F22000 perm 0x5B
+va 0x1000       pte 0x21FC7C5B pa 0x87F1F000 perm 0x5B
+va 0x2000       pte 0x21FC7817 pa 0x87F1E000 perm 0x17
+va 0x3000       pte 0x21FC7407 pa 0x87F1D000 perm 0x7
+va 0x4000       pte 0x21FC70D7 pa 0x87F1C000 perm 0xD7
+va 0x5000       pte 0x0        pa 0x0        perm 0x0
+va 0x6000       pte 0x0        pa 0x0        perm 0x0
+va 0x7000       pte 0x0        pa 0x0        perm 0x0
+va 0x8000       pte 0x0        pa 0x0        perm 0x0
+va 0x9000       pte 0x0        pa 0x0        perm 0x0
+
+va 0x3FFFFF6000 pte 0x0        pa 0x0        perm 0x0
+va 0x3FFFFF7000 pte 0x0        pa 0x0        perm 0x0
+va 0x3FFFFF8000 pte 0x0        pa 0x0        perm 0x0
+va 0x3FFFFF9000 pte 0x0        pa 0x0        perm 0x0
+va 0x3FFFFFA000 pte 0x0        pa 0x0        perm 0x0
+va 0x3FFFFFB000 pte 0x0        pa 0x0        perm 0x0
+va 0x3FFFFFC000 pte 0x0        pa 0x0        perm 0x0
+va 0x3FFFFFD000 pte 0x0        pa 0x0        perm 0x0
+va 0x3FFFFFE000 pte 0x21FD08C7 pa 0x87F42000 perm 0xC7
+va 0x3FFFFFF000 pte 0x2000184B pa 0x80006000 perm 0x4B
+
+
+Permission bits:
+
+PTE_V = 0x01: the page-table entry is valid.
+PTE_R = 0x02: the page is readable.
+PTE_W = 0x04: the page is writable.
+PTE_X = 0x08: the page is executable.
+PTE_U = 0x10: the page can be accessed from user mode.
+PTE_G = 0x20: the mapping is global.
+PTE_A = 0x40: the page has been accessed.
+PTE_D = 0x80: the page has been written.
+
+
+1. Virtual address 0x0
+
+VA 0x0 maps to physical address 0x87F22000.
+
+Its permission value is 0x5B:
+
+PTE_V | PTE_R | PTE_X | PTE_U | PTE_A
+
+This is a valid user-accessible page that is readable and executable,
+but not writable. It contains the beginning of the pgtbltest program,
+primarily executable user code.
+
+
+2. Virtual address 0x1000
+
+VA 0x1000 maps to physical address 0x87F1F000.
+
+Its permission value is also 0x5B:
+
+PTE_V | PTE_R | PTE_X | PTE_U | PTE_A
+
+This page is readable and executable from user mode, but is not
+writable. It contains another portion of the program's executable code
+or read-only program contents.
+
+
+3. Virtual address 0x2000
+
+VA 0x2000 maps to physical address 0x87F1E000.
+
+Its permission value is 0x17:
+
+PTE_V | PTE_R | PTE_W | PTE_U
+
+This is a valid user-accessible, readable, and writable page. It is not
+executable. It contains writable process memory such as initialized
+data, BSS data, or heap-related data.
+
+The accessed and dirty bits were not set when the page table was
+printed.
+
+
+4. Virtual address 0x3000
+
+VA 0x3000 maps to physical address 0x87F1D000.
+
+Its permission value is 0x07:
+
+PTE_V | PTE_R | PTE_W
+
+The PTE_U bit is not present, so ordinary user-mode instructions cannot
+access this page. This page is the stack guard page located below the
+user stack.
+
+The guard page is intentionally inaccessible from user mode. If the
+user stack grows downward beyond its allocated page, accessing the
+guard page causes a page fault instead of silently corrupting another
+memory region.
+
+
+5. Virtual address 0x4000
+
+VA 0x4000 maps to physical address 0x87F1C000.
+
+Its permission value is 0xD7:
+
+PTE_V | PTE_R | PTE_W | PTE_U | PTE_A | PTE_D
+
+This is a valid user-accessible, readable, and writable page. It has
+also been accessed and written. It is the user stack page used by the
+pgtbltest process.
+
+
+6. Virtual addresses 0x5000 through 0x9000
+
+These pages have:
+
+pte 0x0
+pa 0x0
+perm 0x0
+
+They are not mapped in the current process page table. Accessing any of
+these virtual addresses would cause a page fault.
+
+
+7. Virtual addresses 0x3FFFFF6000 through 0x3FFFFFC000
+
+These high virtual-address pages are also unmapped. They are located
+near the top of the user address space but currently contain no valid
+page-table entries.
+
+
+8. Virtual address 0x3FFFFFD000
+
+This address corresponds to the USYSCALL location reserved near the top
+of the user address space.
+
+It is currently unmapped:
+
+pte 0x0
+pa 0x0
+perm 0x0
+
+A later exercise will map a read-only shared page at this address to
+allow user programs to obtain selected process information without
+performing a full system call.
+
+
+9. Virtual address 0x3FFFFFE000
+
+VA 0x3FFFFFE000 maps to physical address 0x87F42000.
+
+Its permission value is 0xC7:
+
+PTE_V | PTE_R | PTE_W | PTE_A | PTE_D
+
+This is the process trapframe page. It stores the saved user registers
+and kernel information needed when switching between user mode and
+kernel mode.
+
+The PTE_U bit is absent, so ordinary user code cannot directly read or
+modify the trapframe.
+
+
+10. Virtual address 0x3FFFFFF000
+
+VA 0x3FFFFFF000 maps to physical address 0x80006000.
+
+Its permission value is 0x4B:
+
+PTE_V | PTE_R | PTE_X | PTE_A
+
+This is the trampoline page. It contains the assembly instructions used
+to enter the kernel from user mode and return from the kernel to user
+mode.
+
+The page is readable and executable, but not writable. The PTE_U bit is
+absent, so it is not a normal user-accessible page.
+
+
+Summary
+
+The low virtual-address pages contain the user program's code, writable
+data, stack guard page, and user stack. The middle pages printed by the
+test are currently unmapped.
+
+The highest mapped pages contain the trapframe and trampoline. These
+pages are included in the process page table because they are needed
+during traps, but they do not have the PTE_U permission and therefore
+cannot be accessed directly by ordinary user-mode code.
+
+The virtual pages appear at consecutive virtual addresses, but their
+physical addresses are not consecutive. This is because xv6 allocates
+physical pages independently with kalloc(), and a page table allows
+arbitrary virtual pages to map to arbitrary physical pages.
