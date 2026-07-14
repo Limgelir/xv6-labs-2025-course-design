@@ -193,3 +193,35 @@ The virtual pages appear at consecutive virtual addresses, but their
 physical addresses are not consecutive. This is because xv6 allocates
 physical pages independently with kalloc(), and a page table allows
 arbitrary virtual pages to map to arbitrary physical pages.
+
+Exercise 2: Speed up system calls
+
+The USYSCALL page could also be used to speed up system calls whose
+return values are small pieces of process or system state that can be
+updated by the kernel and safely exposed read-only to userspace.
+
+For example:
+
+1. uptime()
+
+The kernel could store the current tick count in a shared read-only
+page. A userspace function could read the value directly instead of
+executing an ecall. Since the tick count is global rather than
+per-process, xv6 could map the same physical page read-only into every
+process.
+
+2. getppid(), if xv6 provided it
+
+The kernel could store the parent PID in each process's usyscall page.
+The value would need to be updated whenever the process's parent
+changes, such as during reparenting.
+
+3. Other read-only process information
+
+Values such as process identifiers or selected scheduling statistics
+could be placed in the shared page, provided the kernel updates them
+when they change and userspace only receives read permission.
+
+System calls that perform privileged actions, modify kernel state,
+access files, block, or require complex validation cannot be replaced
+by a read-only shared page.
