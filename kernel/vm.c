@@ -80,41 +80,67 @@ kvminithart()
   sfence_vma();
 }
 
-// Return the address of the PTE in page table pagetable
-// that corresponds to virtual address va.  If alloc!=0,
-// create any required page-table pages.
-//
-// The risc-v Sv39 scheme has three levels of page-table
-// pages. A page-table page contains 512 64-bit PTEs.
-// A 64-bit virtual address is split into five fields:
-//   39..63 -- must be zero.
-//   30..38 -- 9 bits of level-2 index.
-//   21..29 -- 9 bits of level-1 index.
-//   12..20 -- 9 bits of level-0 index.
-//    0..11 -- 12 bits of byte offset within the page.
-pte_t *
-walk(pagetable_t pagetable, uint64 va, int alloc)
+/*
+ * walkinternal() 与原 walk() 类似，但会通过 level_out
+ * 返回找到的叶子 PTE 位于哪一级。
+ *
+ * level = 0：普通 4 KB 页
+ * level = 1：2 MB superpage
+ */
+static pte_t *
+walkinternal(pagetable_t pagetable, uint64 va, int alloc,
+             int *level_out)
 {
-  if(va >= MAXVA)
+  if(va >= MAXVA){
     panic("walk");
+  }
 
-  for(int level = 2; level > 0; level--) {
+  for(int level = 2; level > 0; level--){
     pte_t *pte = &pagetable[PX(level, va)];
-    if(*pte & PTE_V) {
-      pagetable = (pagetable_t)PTE2PA(*pte);
+
+    if(*pte & PTE_V){
 #ifdef LAB_PGTBL
-      if(PTE_LEAF(*pte)) {
+      /*
+       * 若当前 PTE 已经是叶子项，则不能继续把物理页
+       * 当作下一级页表。
+       *
+       * Level-1 叶子就是 2 MB superpage。
+       */
+      if(PTE_LEAF(*pte)){
+        if(level_out != 0){
+          *level_out = level;
+        }
+
         return pte;
       }
 #endif
+
+      pagetable = (pagetable_t)PTE2PA(*pte);
     } else {
-      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+      if(!alloc ||
+         (pagetable = (pagetable_t)kalloc()) == 0){
         return 0;
+      }
+
       memset(pagetable, 0, PGSIZE);
       *pte = PA2PTE(pagetable) | PTE_V;
     }
   }
+
+  if(level_out != 0){
+    *level_out = 0;
+  }
+
   return &pagetable[PX(0, va)];
+}
+
+/*
+ * 保留原来的 walk() 接口，避免修改所有调用者。
+ */
+pte_t *
+walk(pagetable_t pagetable, uint64 va, int alloc)
+{
+  return walkinternal(pagetable, va, alloc, 0);
 }
 
 // Look up a virtual address, return the physical address,
@@ -125,18 +151,46 @@ walkaddr(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
   uint64 pa;
+  int level;
 
-  if(va >= MAXVA)
+  if(va >= MAXVA){
     return 0;
+  }
 
-  pte = walk(pagetable, va, 0);
-  if(pte == 0)
+  pte = walkinternal(pagetable, va, 0, &level);
+
+  if(pte == 0){
     return 0;
-  if((*pte & PTE_V) == 0)
+  }
+
+  if((*pte & PTE_V) == 0){
     return 0;
-  if((*pte & PTE_U) == 0)
+  }
+
+  if((*pte & PTE_U) == 0){
     return 0;
+  }
+
   pa = PTE2PA(*pte);
+
+  /*
+   * 普通 Level-0 PTE：
+   * PTE2PA() 已经是当前 4 KB 页起始地址。
+   *
+   * Level-1 superpage：
+   * PTE2PA() 是整张 2 MB 页的起始地址，
+   * 还必须加入 va 在 superpage 内部的偏移。
+   */
+  if(level == 1){
+    pa += va & (SUPERPGSIZE - 1);
+
+    /*
+     * copyin/copyout 后面还会加入页内偏移，
+     * 因此这里返回当前 4 KB 子页的物理起点。
+     */
+    pa = PGROUNDDOWN(pa);
+  }
+
   return pa;
 }
 
@@ -181,7 +235,88 @@ vmprint(pagetable_t pagetable)
 
 #endif
 
+/*
+ * 返回虚拟地址 va 对应的 Level-1 PTE。
+ *
+ * 普通 walk() 会一直走到 Level-0；
+ * superpage 需要直接在 Level-1 建立叶子 PTE。
+ */
+static pte_t *
+walksuper(pagetable_t pagetable, uint64 va, int alloc)
+{
+  pte_t *pte;
 
+  if(va >= MAXVA){
+    panic("walksuper");
+  }
+
+  /*
+   * 先查看 Level-2 PTE。
+   * Level-2 索引对应 Sv39 地址中的 VPN[2]。
+   */
+  pte = &pagetable[PX(2, va)];
+
+  if(*pte & PTE_V){
+    /*
+     * 如果 Level-2 本身已经是叶子项，则不能在它下面
+     * 建立 Level-1 页表。
+     */
+    if(PTE_LEAF(*pte)){
+      return 0;
+    }
+
+    pagetable = (pagetable_t)PTE2PA(*pte);
+  } else {
+    if(!alloc ||
+       (pagetable = (pagetable_t)kalloc()) == 0){
+      return 0;
+    }
+
+    memset(pagetable, 0, PGSIZE);
+    *pte = PA2PTE(pagetable) | PTE_V;
+  }
+
+  /*
+   * 当前 pagetable 已经是 Level-1 页表页。
+   */
+  return &pagetable[PX(1, va)];
+}
+
+/*
+ * 在 Level-1 建立一张 2 MB superpage 映射。
+ */
+static int
+supermappage(pagetable_t pagetable, uint64 va,
+             uint64 pa, int perm)
+{
+  pte_t *pte;
+
+  if((va % SUPERPGSIZE) != 0){
+    panic("supermappage: va");
+  }
+
+  if((pa % SUPERPGSIZE) != 0){
+    panic("supermappage: pa");
+  }
+
+  pte = walksuper(pagetable, va, 1);
+
+  if(pte == 0){
+    return -1;
+  }
+
+  if(*pte & PTE_V){
+    panic("supermappage: remap");
+  }
+
+  /*
+   * 只要 Level-1 PTE 同时具有 PTE_V 和至少一个 R/W/X
+   * 权限，硬件就会把它视为 2 MB 叶子映射。
+   */
+  *pte = PA2PTE(pa) | perm | PTE_V;
+
+  return 0;
+}
 
 // add a mapping to the kernel page table.
 // only used when booting.
@@ -242,65 +377,267 @@ uvmcreate()
   return pagetable;
 }
 
+/*
+ * 将 Level-1 superpage 降级为 512 张普通 4 KB 页面。
+ *
+ * 转换前：
+ *   Level-1 叶子 PTE → 一张 2 MB 物理页
+ *
+ * 转换后：
+ *   Level-1 非叶子 PTE → Level-0 页表
+ *   Level-0 页表中有 512 个普通叶子 PTE
+ */
+static int
+demote_superpage(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  pte_t oldpte;
+  uint64 oldpa;
+  uint flags;
+  pagetable_t newtable;
+  int level;
+
+  pte = walkinternal(pagetable, va, 0, &level);
+
+  if(pte == 0 ||
+     level != 1 ||
+     !PTE_LEAF(*pte)){
+    return -1;
+  }
+
+  oldpte = *pte;
+  oldpa = PTE2PA(oldpte);
+  flags = PTE_FLAGS(oldpte);
+
+  /*
+   * 分配一张新的 Level-0 页表。
+   */
+  newtable = (pagetable_t)kalloc();
+
+  if(newtable == 0){
+    return -1;
+  }
+
+  memset(newtable, 0, PGSIZE);
+
+  /*
+   * 为原 superpage 的每个 4 KB 区域分配普通物理页，
+   * 并复制原有内容。
+   */
+  for(int i = 0; i < 512; i++){
+    char *mem = kalloc();
+
+    if(mem == 0){
+      /*
+       * 分配失败时，释放已经创建的普通页，
+       * 原 superpage 映射暂时保持不变。
+       */
+      for(int j = 0; j < i; j++){
+        if(newtable[j] & PTE_V){
+          kfree((void *)PTE2PA(newtable[j]));
+          newtable[j] = 0;
+        }
+      }
+
+      kfree(newtable);
+      return -1;
+    }
+
+    memmove(mem,
+            (void *)(oldpa + (uint64)i * PGSIZE),
+            PGSIZE);
+
+    /*
+     * 保留原 superpage 的用户、读写等权限。
+     * flags 中已经包含 PTE_V。
+     */
+    newtable[i] = PA2PTE(mem) | flags;
+  }
+
+  /*
+   * 将原来的 Level-1 叶子 PTE 改成非叶子 PTE，
+   * 指向刚刚创建的 Level-0 页表。
+   */
+  *pte = PA2PTE(newtable) | PTE_V;
+
+  /*
+   * 新普通页已经保存全部内容，因此可以释放旧 superpage。
+   */
+  superfree((void *)oldpa);
+
+  // 页表结构改变后刷新 TLB。
+  sfence_vma();
+
+  return 0;
+}
+
 // Remove npages of mappings starting from va. va must be
 // page-aligned. It's OK if the mappings don't exist.
 // Optionally free the physical memory.
 void
-uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+uvmunmap(pagetable_t pagetable, uint64 va,
+         uint64 npages, int do_free)
 {
   uint64 a;
-  pte_t *pte;
-  int sz = PGSIZE;
+  uint64 endva;
 
-  if((va % PGSIZE) != 0)
+  if((va % PGSIZE) != 0){
     panic("uvmunmap: not aligned");
+  }
 
-  for(a = va; a < va + npages*PGSIZE; a += sz){
-    if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
+  a = va;
+  endva = va + npages * PGSIZE;
+
+  while(a < endva){
+    pte_t *pte;
+    int level;
+
+    pte = walkinternal(pagetable, a, 0, &level);
+
+    /*
+     * 保留当前实验分支允许“未映射页”的行为。
+     */
+    if(pte == 0 || (*pte & PTE_V) == 0){
+      a += PGSIZE;
       continue;
-    if((*pte & PTE_V) == 0)  // has physical page been allocated?
-      continue;
-    sz = PGSIZE;
-    if(PTE_FLAGS(*pte) == PTE_V)
+    }
+
+    if(!PTE_LEAF(*pte)){
       panic("uvmunmap: not a leaf");
+    }
+
+    /*
+     * 当前地址位于 Level-1 superpage。
+     */
+    if(level == 1){
+      uint64 superbase;
+
+      superbase =
+          a & ~((uint64)SUPERPGSIZE - 1);
+
+      /*
+       * 如果当前释放从 superpage 起点开始，
+       * 且后续范围完整覆盖 2 MB，就直接释放整张页。
+       */
+      if(a == superbase &&
+         endva - a >= SUPERPGSIZE){
+        if(do_free){
+          superfree((void *)PTE2PA(*pte));
+        }
+
+        *pte = 0;
+        a += SUPERPGSIZE;
+        continue;
+      }
+
+      /*
+       * 仅释放 superpage 的一部分：
+       * 先降级，再重新处理同一个虚拟地址。
+       */
+      if(demote_superpage(pagetable, a) < 0){
+        panic("uvmunmap: demote");
+      }
+
+      /*
+       * 不改变 a。
+       * 下一轮重新 walk 后，会得到普通 Level-0 PTE。
+       */
+      continue;
+    }
+
+    /*
+     * 普通 4 KB 页面。
+     */
     if(do_free){
       uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+      kfree((void *)pa);
     }
+
     *pte = 0;
+    a += PGSIZE;
   }
+
+  sfence_vma();
 }
 
 
 // Allocate PTEs and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
-uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+uvmalloc(pagetable_t pagetable, uint64 oldsz,
+         uint64 newsz, int xperm)
 {
   char *mem;
   uint64 a;
   int sz;
 
-  if(newsz < oldsz)
+  if(newsz < oldsz){
     return oldsz;
+  }
 
   oldsz = PGROUNDUP(oldsz);
+
+  /*
+   * 每轮可能增加：
+   * - 4 KB 普通页面；
+   * - 2 MB superpage。
+   */
   for(a = oldsz; a < newsz; a += sz){
-    sz = PGSIZE;
-    mem = kalloc();
-    if(mem == 0){
-      uvmdealloc(pagetable, a, oldsz);
-      return 0;
-    }
-#ifndef LAB_SYSCALL
-    memset(mem, 0, sz);
- #endif
-    if(mappages(pagetable, a, sz, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
-      kfree(mem);
-      uvmdealloc(pagetable, a, oldsz);
-      return 0;
+    /*
+     * 使用 superpage 必须同时满足：
+     *
+     * 1. 当前虚拟地址按 2 MB 对齐；
+     * 2. 剩余待分配范围至少还有 2 MB。
+     */
+    if((a % SUPERPGSIZE) == 0 &&
+       newsz - a >= SUPERPGSIZE){
+      sz = SUPERPGSIZE;
+
+      mem = superalloc();
+
+      if(mem == 0){
+        /*
+         * 如果 superpage 池已经用完，也可以退回普通页。
+         * 为简化和保证当前测试稳定，这里直接清理并失败。
+         */
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
+
+      memset(mem, 0, SUPERPGSIZE);
+
+      if(supermappage(pagetable,
+                      a,
+                      (uint64)mem,
+                      PTE_R | PTE_U | xperm) != 0){
+        superfree(mem);
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
+    } else {
+      sz = PGSIZE;
+
+      mem = kalloc();
+
+      if(mem == 0){
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
+
+      memset(mem, 0, PGSIZE);
+
+      if(mappages(pagetable,
+                  a,
+                  PGSIZE,
+                  (uint64)mem,
+                  PTE_R | PTE_U | xperm) != 0){
+        kfree(mem);
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
     }
   }
+
   return newsz;
 }
 
@@ -363,31 +700,112 @@ int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
-  uint64 pa, i;
+  uint64 pa;
+  uint64 i;
   uint flags;
   char *mem;
-  int szinc = PGSIZE;
+  int level;
 
-  for(i = 0; i < sz; i += szinc){
-    if((pte = walk(old, i, 0)) == 0)
-      continue;
-    if((*pte & PTE_V) == 0) {
+  for(i = 0; i < sz; ){
+    /*
+     * walkinternal() 不仅返回 PTE，
+     * 还通过 level 告诉我们它是：
+     *
+     * level == 0：普通 4 KB 页面；
+     * level == 1：2 MB superpage。
+     */
+    pte = walkinternal(old, i, 0, &level);
+
+    /*
+     * 当前 xv6 允许地址空间中存在未映射区域，
+     * 因此直接跳过。
+     */
+    if(pte == 0 || (*pte & PTE_V) == 0){
+      i += PGSIZE;
       continue;
     }
-    szinc = PGSIZE;
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+
+    if(level == 1){
+      /*
+       * Level-1 叶子代表一张 2 MB superpage。
+       * 起始虚拟地址应当按 2 MB 对齐。
+       */
+      if((i % SUPERPGSIZE) != 0){
+        panic("uvmcopy: super alignment");
+      }
+
+      /*
+       * 正常情况下，进程大小应包含完整的 superpage。
+       */
+      if(i + SUPERPGSIZE > sz){
+        panic("uvmcopy: partial superpage");
+      }
+
+      /*
+       * 为子进程重新分配一张独立的 2 MB 物理页。
+       */
+      mem = superalloc();
+      if(mem == 0){
+        goto err;
+      }
+
+      /*
+       * 复制完整的 2 MB 内容。
+       */
+      memmove(mem, (void *)pa, SUPERPGSIZE);
+
+      /*
+       * 在子进程页表中同样创建 Level-1 叶子 PTE。
+       *
+       * supermappage() 会自己添加 PTE_V，
+       * 所以这里先去除已有的 PTE_V。
+       */
+      if(supermappage(new,
+                      i,
+                      (uint64)mem,
+                      flags & ~PTE_V) != 0){
+        superfree(mem);
+        goto err;
+      }
+
+      /*
+       * 一次跳过完整的 2 MB。
+       */
+      i += SUPERPGSIZE;
+    } else {
+      /*
+       * 普通 4 KB 页面保持 xv6 原来的复制方式。
+       */
+      mem = kalloc();
+      if(mem == 0){
+        goto err;
+      }
+
+      memmove(mem, (void *)pa, PGSIZE);
+
+      if(mappages(new,
+                  i,
+                  PGSIZE,
+                  (uint64)mem,
+                  flags) != 0){
+        kfree(mem);
+        goto err;
+      }
+
+      i += PGSIZE;
     }
   }
+
   return 0;
 
- err:
+err:
+  /*
+   * 你的 uvmunmap() 已经支持普通页和 superpage，
+   * 因此这里可以统一清理。
+   */
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
