@@ -142,10 +142,43 @@ walkaddr(pagetable_t pagetable, uint64 va)
 
 
 #if defined(LAB_PGTBL) || defined(SOL_MMAP) || defined(SOL_COW)
-void
-vmprint(pagetable_t pagetable) {
-  // your code here
+
+static void
+vmprint_recursive(pagetable_t pagetable, int level, uint64 base_va)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+
+    if((pte & PTE_V) == 0){
+      continue;
+    }
+
+    uint64 pa = PTE2PA(pte);
+    uint64 va = base_va | ((uint64)i << PXSHIFT(level));
+
+    for(int depth = 0; depth < 3 - level; depth++){
+      printf(" ..");
+    }
+
+    printf("%p: pte %p pa %p\n",
+           (void *)va,
+           (void *)pte,
+           (void *)pa);
+
+    if(level > 0 &&
+       (pte & (PTE_R | PTE_W | PTE_X)) == 0){
+      vmprint_recursive((pagetable_t)pa, level - 1, va);
+    }
+  }
 }
+
+void
+vmprint(pagetable_t pagetable)
+{
+  printf("page table %p\n", (void *)pagetable);
+  vmprint_recursive(pagetable, 2, 0);
+}
+
 #endif
 
 

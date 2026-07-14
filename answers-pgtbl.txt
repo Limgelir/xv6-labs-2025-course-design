@@ -225,3 +225,67 @@ when they change and userspace only receives read permission.
 System calls that perform privileged actions, modify kernel state,
 access files, block, or require complex validation cannot be replaced
 by a read-only shared page.
+
+Exercise 3: Print a page table
+
+The vmprint function recursively prints the three-level Sv39 page
+table. It prints only valid page-table entries.
+
+A non-leaf PTE has PTE_V set but none of PTE_R, PTE_W, or PTE_X set.
+Such an entry points to a lower-level page-table page.
+
+A leaf PTE has at least one of PTE_R, PTE_W, or PTE_X set. A leaf entry
+maps a virtual address to a physical page.
+
+The observed leaf mappings included:
+
+1. VA 0x0
+
+This page contains the beginning of the pgtbltest user program. It is
+readable and executable from user mode, but not writable.
+
+2. VA 0x1000
+
+This page contains another part of the user program's executable or
+read-only contents. It is readable and executable from user mode.
+
+3. VA 0x2000
+
+This page contains writable user data. It is readable and writable
+from user mode, but not executable.
+
+4. VA 0x3000
+
+This is the user stack guard page. It is mapped but does not have
+PTE_U, so ordinary user-mode instructions cannot access it.
+
+5. VA 0x4000
+
+This is the user stack page. It is readable and writable from user
+mode.
+
+6. VA 0x3fffffd000
+
+This is the USYSCALL page. It stores the current process PID and is
+mapped read-only for user mode. Its permissions include PTE_V,
+PTE_R, and PTE_U, but not PTE_W.
+
+7. VA 0x3fffffe000
+
+This is the TRAPFRAME page. It stores the saved user registers and
+kernel information needed during trap handling. It does not have
+PTE_U, so normal user code cannot access it.
+
+8. VA 0x3ffffff000
+
+This is the TRAMPOLINE page. It contains the assembly code used to
+enter and leave the kernel. It is readable and executable, but not
+writable, and it does not have PTE_U.
+
+The vmprint output also shows the intermediate level-2 and level-1
+page-table entries. These entries point to lower-level page tables
+rather than directly mapping user memory.
+
+The virtual addresses printed by vmprint correspond to the mappings
+previously shown by print_pgtbl, while vmprint additionally reveals
+the complete tree structure of the Sv39 page table.
