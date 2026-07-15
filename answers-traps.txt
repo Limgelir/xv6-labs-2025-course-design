@@ -1,0 +1,200 @@
+Lab Traps
+Exercise 1: RISC-V assembly
+
+1. Which registers contain arguments to functions? For example, which
+   register holds 13 in main's call to printf?
+
+Answer:
+
+According to the RISC-V calling convention, the first eight function
+arguments are passed in registers a0 through a7.
+
+In main, the following function call is made:
+
+printf("%d %d\n", f(8) + 1, 13);
+
+The arguments are passed as follows:
+
+a0: the address of the format string "%d %d\n"
+a1: the value of f(8) + 1, which is 12
+a2: the integer 13
+
+The assembly code confirms this:
+
+0x24: li a2, 13
+0x26: li a1, 12
+
+Therefore, the value 13 is stored in register a2.
+
+
+2. Where is the call to function f in main? Where is the call to
+   function g in f?
+
+Answer:
+
+There is no actual call to f in main.
+
+The compiler determines that:
+
+g(8) = 8 + 3 = 11
+f(8) = g(8) = 11
+f(8) + 1 = 12
+
+Therefore, the compiler places the constant value 12 directly into
+register a1:
+
+0x26: li a1, 12
+
+There is also no actual call to g in f. The compiler has inlined the
+operation performed by g into f.
+
+The relevant instruction in f is:
+
+0x14: addiw a0, a0, 3
+
+This instruction directly adds 3 to the argument in a0.
+
+Although separate g and f functions are still present in the generated
+assembly, the calls between main, f, and g have been optimized away.
+
+
+3. At what address is the function printf located?
+
+Answer:
+
+The printf function is located at virtual address:
+
+0x6f6
+
+This can be seen from the symbol in call.asm:
+
+00000000000006f6 <printf>:
+
+
+4. What value is in the register ra just after the instruction that
+   calls printf in main?
+
+Answer:
+
+The instruction that calls printf is located at address 0x30:
+
+0x30: jal 0x6f6 <printf>
+
+In the generated assembly, the compiler uses the jal instruction
+directly rather than displaying an auipc/jalr instruction pair.
+
+The instruction immediately following the call is located at address
+0x34:
+
+0x34: li a0, 0
+
+The jal instruction saves the address of the next instruction in the
+ra register.
+
+Therefore, immediately after the call instruction executes:
+
+ra = 0x34
+
+This address is used to return from printf to main.
+
+
+5. Run the following code:
+
+unsigned int i = 0x00646c72;
+printf("H%x Wo%s", 57616, (char *)&i);
+
+What is the output? Explain how the output depends on RISC-V being
+little-endian. If RISC-V were big-endian, what value would i need to
+have in order to produce the same output? Would 57616 need to be
+changed?
+
+Answer:
+
+The output is:
+
+He110 World
+
+The first conversion is:
+
+57616 decimal = 0xe110 hexadecimal
+
+Therefore, the format sequence:
+
+H%x
+
+produces:
+
+He110
+
+The integer i has the value:
+
+0x00646c72
+
+On a little-endian machine, the least significant byte is stored at
+the lowest memory address. Therefore, i is stored in memory in this
+order:
+
+Address offset 0: 0x72 = 'r'
+Address offset 1: 0x6c = 'l'
+Address offset 2: 0x64 = 'd'
+Address offset 3: 0x00 = string terminator
+
+When the address of i is converted to char *, printf interprets these
+bytes as the string:
+
+"rld"
+
+The format string already contains " Wo", so the complete output is:
+
+He110 World
+
+If RISC-V were big-endian, the most significant byte would be stored
+at the lowest memory address. To place the bytes:
+
+0x72 0x6c 0x64 0x00
+
+in increasing memory addresses, i would need to be:
+
+0x726c6400
+
+The value 57616 would not need to be changed. The %x conversion formats
+the numerical value of the argument, so its output does not depend on
+the byte order used to store that integer in memory.
+
+
+6. In the following code, what will be printed after y=? Why does this
+   happen?
+
+printf("x=%d y=%d", 3);
+
+Answer:
+
+The program reliably prints:
+
+x=3
+
+However, the value printed after y= is indeterminate and cannot be
+predicted as a specific number.
+
+The format string requests two integer arguments:
+
+the first %d expects the value of x
+the second %d expects the value of y
+
+Only one integer argument, 3, is actually supplied.
+
+Under the RISC-V calling convention, the arguments would normally be
+passed as follows:
+
+a0: address of the format string
+a1: integer value 3
+a2: second integer argument
+
+Since the caller does not provide a second integer argument, a2 does
+not contain a valid value for this printf call. printf will still try
+to read the next argument from its variable-argument area, which was
+initialized from the argument registers.
+
+As a result, the value printed for y comes from unrelated residual
+data. This is undefined behavior, so the value after y= may vary and
+must not be assumed to be zero or any other fixed value.
