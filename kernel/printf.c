@@ -134,6 +134,50 @@ printf(char *fmt, ...)
 }
 
 void
+backtrace(void)
+{
+  uint64 fp;
+  uint64 stack_bottom;
+  uint64 stack_top;
+
+  printf("backtrace:\n");
+
+  fp = r_fp();
+
+  /*
+   * 每个内核栈恰好占一页。
+   * PGROUNDDOWN(fp) 得到当前内核栈页的起始地址。
+   */
+  stack_bottom = PGROUNDDOWN(fp);
+  stack_top = stack_bottom + PGSIZE;
+
+  while(fp >= stack_bottom + 16 && fp < stack_top){
+    uint64 return_address;
+    uint64 previous_fp;
+
+    /*
+     * RISC-V 栈帧布局：
+     *
+     * fp - 8  ：保存的返回地址
+     * fp - 16 ：调用者的 frame pointer
+     */
+    return_address = *(uint64 *)(fp - 8);
+    previous_fp = *(uint64 *)(fp - 16);
+
+    printf("%p\n", (void *)return_address);
+
+    /*
+     * 防止栈损坏导致死循环或反向移动。
+     */
+    if(previous_fp <= fp){
+      break;
+    }
+
+    fp = previous_fp;
+  }
+}
+
+void
 panic(char *s)
 {
   panicking = 1;
