@@ -8,6 +8,8 @@
 #include "proc.h"
 #include "fs.h"
 
+static int cowalloc(pagetable_t pagetable, uint64 va);
+
 /*
  * the kernel's page table.
  */
@@ -297,28 +299,47 @@ int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
-  uint64 pa, i;
+  uint64 pa;
+  uint64 i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      continue;   // page table entry hasn't been allocated
+    pte = walk(old, i, 0);
+
+    if(pte == 0)
+      continue;
+
     if((*pte & PTE_V) == 0)
-      continue;   // physical page hasn't been allocated
+      continue;
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+
+    /*
+     * 只有原本可写的页才转成 COW 页。
+     * 原本只读的代码页继续保持普通只读共享。
+     */
+    if(flags & PTE_W){
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte = PA2PTE(pa) | flags;
     }
+
+    /*
+     * 子进程映射同一个物理页。
+     */
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
+      goto err;
+
+    /*
+     * 多了一个子进程 PTE 引用。
+     */
+    kaddref((void*)pa);
   }
+
+  sfence_vma();
   return 0;
 
- err:
+err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
@@ -342,35 +363,86 @@ uvmclear(pagetable_t pagetable, uint64 va)
 int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
-  uint64 n, va0, pa0;
+  uint64 n;
+  uint64 va0;
+  uint64 pa0;
   pte_t *pte;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+
+    /*
+     * 防止超出 Sv39 用户虚拟地址范围。
+     */
     if(va0 >= MAXVA)
       return -1;
-  
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
-        return -1;
-      }
-    }
 
     pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
+
+    /*
+     * 页表项不存在时，可能是 sbrk() 创建的懒分配区域。
+     * 尝试通过 vmfault() 分配普通可写页面。
+     */
+    if(pte == 0 || (*pte & PTE_V) == 0){
+      if(vmfault(pagetable, va0, 0) == 0)
+        return -1;
+
+      /*
+       * vmfault() 修改了页表，因此重新取得 PTE。
+       */
+      pte = walk(pagetable, va0, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0)
+        return -1;
+    }
+
+    /*
+     * 目标必须是用户页面。
+     *
+     * TRAPFRAME、TRAMPOLINE、保护页等没有 PTE_U，
+     * copyout() 不允许向这些页面写入。
+     */
+    if((*pte & PTE_U) == 0)
+      return -1;
+
+    /*
+     * 如果目标是 COW 页面，先完成写时复制。
+     */
+    if(*pte & PTE_COW){
+      if(cowalloc(pagetable, va0) < 0)
+        return -1;
+
+      /*
+       * cowalloc() 已将 PTE 替换为新页面映射，
+       * 所以必须重新读取。
+       */
+      pte = walk(pagetable, va0, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0)
+        return -1;
+    }
+
+    /*
+     * 不是 COW 页且没有 PTE_W，说明它是真正的只读页。
+     *
+     * 例如地址 0 对应的用户代码页通常可读、可执行，
+     * 但不可写。必须返回失败，不能直接 memmove()，
+     * 否则会破坏用户程序指令。
+     */
     if((*pte & PTE_W) == 0)
       return -1;
-      
+
+    pa0 = PTE2PA(*pte);
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
+
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
     src += n;
     dstva = va0 + PGSIZE;
   }
+
   return 0;
 }
 
@@ -445,6 +517,64 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   }
 }
 
+static int
+cowalloc(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  char *mem;
+
+  va = PGROUNDDOWN(va);
+
+  if(va >= MAXVA)
+    return -1;
+
+  pte = walk(pagetable, va, 0);
+
+  if(pte == 0)
+    return -1;
+
+  if((*pte & PTE_V) == 0)
+    return -1;
+
+  if((*pte & PTE_U) == 0)
+    return -1;
+
+  /*
+   * 不是 COW 页，不能通过复制变为可写。
+   */
+  if((*pte & PTE_COW) == 0)
+    return -1;
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  mem = kalloc();
+  if(mem == 0)
+    return -1;
+
+  memmove(mem, (void*)pa, PGSIZE);
+
+  /*
+   * 新页由当前进程独占：
+   * 清除 COW，恢复可写权限。
+   */
+  flags = (flags | PTE_W) & ~PTE_COW;
+
+  *pte = PA2PTE(mem) | flags;
+
+  /*
+   * 当前进程不再引用原物理页。
+   * kfree() 会减少引用计数，
+   * 只有计数为 0 才真正释放。
+   */
+  kfree((void*)pa);
+
+  sfence_vma();
+  return 0;
+}
+
 // allocate and map user memory if process is referencing a page
 // that was lazily allocated in sys_sbrk().
 // returns 0 if va is invalid or already mapped, or if
@@ -452,6 +582,14 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
+  /*
+   * write fault: read == 0
+   */
+  if(read == 0){
+    if(cowalloc(pagetable, va) == 0)
+      return PGROUNDDOWN(va);
+  }
+
   uint64 mem;
   struct proc *p = myproc();
 

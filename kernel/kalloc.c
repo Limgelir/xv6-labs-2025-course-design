@@ -9,6 +9,14 @@
 #include "riscv.h"
 #include "defs.h"
 
+#define PA2INDEX(pa) (((uint64)(pa) - KERNBASE) / PGSIZE)
+#define NPAGE ((PHYSTOP - KERNBASE) / PGSIZE)
+
+struct {
+  struct spinlock lock;
+  int count[NPAGE];
+} ref;
+
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -27,6 +35,7 @@ void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&ref.lock, "ref");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -35,8 +44,14 @@ freerange(void *pa_start, void *pa_end)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
+    acquire(&ref.lock);
+    ref.count[PA2INDEX(p)] = 1;
+    release(&ref.lock);
+
     kfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by pa,
@@ -47,11 +62,32 @@ void
 kfree(void *pa)
 {
   struct run *r;
+  int count;
 
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+  if(((uint64)pa % PGSIZE) != 0 ||
+     (char*)pa < end ||
+     (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
+  acquire(&ref.lock);
+
+  ref.count[PA2INDEX(pa)]--;
+  count = ref.count[PA2INDEX(pa)];
+
+  if(count < 0){
+    release(&ref.lock);
+    panic("kfree ref");
+  }
+
+  release(&ref.lock);
+
+  /*
+   * 仍有其他页表引用该物理页，
+   * 此时不能真正释放。
+   */
+  if(count > 0)
+    return;
+
   memset(pa, 1, PGSIZE);
 
   r = (struct run*)pa;
@@ -76,7 +112,38 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
+  if(r){
+    memset((char*)r, 5, PGSIZE);
+
+    acquire(&ref.lock);
+    ref.count[PA2INDEX(r)] = 1;
+    release(&ref.lock);
+  }
+
   return (void*)r;
+}
+
+void
+kaddref(void *pa)
+{
+  if(((uint64)pa % PGSIZE) != 0 ||
+     (uint64)pa < KERNBASE ||
+     (uint64)pa >= PHYSTOP)
+    panic("kaddref");
+
+  acquire(&ref.lock);
+  ref.count[PA2INDEX(pa)]++;
+  release(&ref.lock);
+}
+
+int
+kgetref(void *pa)
+{
+  int count;
+
+  acquire(&ref.lock);
+  count = ref.count[PA2INDEX(pa)];
+  release(&ref.lock);
+
+  return count;
 }
