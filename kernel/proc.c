@@ -124,6 +124,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  memset(p->vmas, 0, sizeof(p->vmas));
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -168,6 +169,7 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  memset(p->vmas, 0, sizeof(p->vmas));
   p->state = UNUSED;
 }
 
@@ -272,6 +274,15 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
+  // Copy VMA metadata. Faulted pages were copied by uvmcopy(); absent
+  // pages remain lazy in the child. Each VMA owns a file reference.
+  for(i = 0; i < NVMA; i++){
+    if(p->vmas[i].used){
+      np->vmas[i] = p->vmas[i];
+      np->vmas[i].file = filedup(p->vmas[i].file);
+    }
+  }
+
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -327,6 +338,11 @@ kexit(int status)
 
   if(p == initproc)
     panic("init exiting");
+  // A mapping owns a separate file reference and remains valid after close(fd).
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used)
+      vmaunmap(p, p->vmas[i].addr, p->vmas[i].len);
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

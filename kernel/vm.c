@@ -7,6 +7,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
 
 /*
  * the kernel's page table.
@@ -211,6 +214,78 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   }
 }
 
+// Unmap a range at the start or end of a VMA. MAP_SHARED pages that
+// have been faulted in are written back before their memory is released.
+int
+vmaunmap(struct proc *p, uint64 addr, uint64 len)
+{
+  struct vma *v = 0;
+  struct file *f;
+  uint64 end;
+  int result = 0;
+
+  if((addr % PGSIZE) != 0 || len == 0)
+    return -1;
+  len = PGROUNDUP(len);
+  if(addr + len < addr)
+    return -1;
+  end = addr + len;
+
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used && addr >= p->vmas[i].addr &&
+       end <= p->vmas[i].addr + p->vmas[i].len){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if(v == 0)
+    return -1;
+
+  // The lab permits removing the beginning, the end, or the entire VMA.
+  if(addr != v->addr && end != v->addr + v->len)
+    return -1;
+
+  if(v->flags == MAP_SHARED && (v->prot & PROT_WRITE)){
+    for(uint64 a = addr; a < end; a += PGSIZE){
+      pte_t *pte = walk(p->pagetable, a, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0)
+        continue;
+
+      uint64 off = v->offset + (a - v->addr);
+      uint64 pa = PTE2PA(*pte);
+      uint n = PGSIZE;
+
+      begin_op();
+      ilock(v->file->ip);
+      if(off >= v->file->ip->size){
+        n = 0;
+      } else if(off + n > v->file->ip->size){
+        n = v->file->ip->size - off;
+      }
+      if(n > 0 && writei(v->file->ip, 0, pa, off, n) != n)
+        result = -1;
+      iunlock(v->file->ip);
+      end_op();
+    }
+  }
+
+  uvmunmap(p->pagetable, addr, len / PGSIZE, 1);
+
+  if(addr == v->addr && len == v->len){
+    f = v->file;
+    memset(v, 0, sizeof(*v));
+    fileclose(f);
+  } else if(addr == v->addr){
+    v->addr += len;
+    v->len -= len;
+    v->offset += len;
+  } else {
+    v->len -= len;
+  }
+
+  return result;
+}
+
 // Allocate PTEs and physical memory to grow a process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
@@ -384,9 +459,11 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
+    if(va0 >= MAXVA)
+      return -1;
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+      if((pa0 = vmfault(pagetable, va0, 1)) == 0) {
         return -1;
       }
     }
@@ -455,18 +532,59 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   uint64 mem;
   struct proc *p = myproc();
 
-  if (va >= p->sz)
-    return 0;
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
+  if(va >= MAXVA)
     return 0;
+  if(ismapped(pagetable, va))
+    return 0;
+
+  // mmap() reserves addresses only; load a file page on first access.
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vmas[i];
+    if(!v->used || va < v->addr || va >= v->addr + v->len)
+      continue;
+
+    if((read && !(v->prot & PROT_READ)) ||
+       (!read && !(v->prot & PROT_WRITE)))
+      return 0;
+
+    mem = (uint64)kalloc();
+    if(mem == 0)
+      return 0;
+    memset((void*)mem, 0, PGSIZE);
+
+    ilock(v->file->ip);
+    int n = readi(v->file->ip, 0, mem,
+                  v->offset + (va - v->addr), PGSIZE);
+    iunlock(v->file->ip);
+    if(n < 0){
+      kfree((void*)mem);
+      return 0;
+    }
+
+    int perm = PTE_U;
+    if(v->prot & PROT_READ)
+      perm |= PTE_R;
+    if(v->prot & PROT_WRITE)
+      perm |= PTE_R | PTE_W;
+    if(v->prot & PROT_EXEC)
+      perm |= PTE_X;
+    if(mappages(pagetable, va, PGSIZE, mem, perm) != 0){
+      kfree((void*)mem);
+      return 0;
+    }
+    return mem;
   }
-  mem = (uint64) kalloc();
+
+  // Preserve the branch's existing lazy-sbrk behavior outside VMAs.
+  if(va >= p->sz)
+    return 0;
+  mem = (uint64)kalloc();
   if(mem == 0)
     return 0;
-  memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
-    kfree((void *)mem);
+  memset((void*)mem, 0, PGSIZE);
+  if(mappages(pagetable, va, PGSIZE, mem, PTE_W | PTE_U | PTE_R) != 0){
+    kfree((void*)mem);
     return 0;
   }
   return mem;

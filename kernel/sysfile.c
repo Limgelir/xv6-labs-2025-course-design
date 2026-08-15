@@ -6,6 +6,7 @@
 
 #include "types.h"
 #include "riscv.h"
+#include "memlayout.h"
 #include "defs.h"
 #include "param.h"
 #include "stat.h"
@@ -368,6 +369,82 @@ sys_open(void)
   end_op();
 
   return fd;
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 requested, len, offset;
+  int prot, flags;
+  struct file *f;
+  struct proc *p = myproc();
+  struct vma *v = 0;
+
+  argaddr(0, &requested);
+  argaddr(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  if(argfd(4, 0, &f) < 0)
+    return -1;
+  argaddr(5, &offset);
+
+  if(requested != 0 || len == 0 || offset != 0)
+    return -1;
+  if((prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 ||
+     (prot & (PROT_READ | PROT_WRITE)) == 0)
+    return -1;
+  if(flags != MAP_SHARED && flags != MAP_PRIVATE)
+    return -1;
+  if(f->type != FD_INODE || !f->readable)
+    return -1;
+  if(flags == MAP_SHARED && (prot & PROT_WRITE) && !f->writable)
+    return -1;
+
+  for(int i = 0; i < NVMA; i++){
+    if(!p->vmas[i].used){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if(v == 0)
+    return -1;
+
+  len = PGROUNDUP(len);
+  // Keep file mappings outside the low address range used by the program and
+  // sbrk(). Otherwise, after munmap() removes a page, vmfault() could mistake
+  // that hole for lazily allocated heap and map a new zero-filled page there.
+  uint64 addr = MAXVA / 2;
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used &&
+       addr < p->vmas[i].addr + p->vmas[i].len)
+      addr = PGROUNDUP(p->vmas[i].addr + p->vmas[i].len);
+  }
+
+  if(addr >= TRAPFRAME || len > TRAPFRAME - addr)
+    return -1;
+
+  v->used = 1;
+  v->addr = addr;
+  v->len = len;
+  v->prot = prot;
+  v->flags = flags;
+  v->offset = offset;
+  v->file = filedup(f);
+
+  return addr;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, len;
+
+  argaddr(0, &addr);
+  argaddr(1, &len);
+  if(len == 0)
+    return -1;
+
+  return vmaunmap(myproc(), addr, len);
 }
 
 uint64
